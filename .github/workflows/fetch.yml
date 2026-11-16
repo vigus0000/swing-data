@@ -1,9 +1,10 @@
 # 放到你的 GitHub repo：.github/workflows/fetch.yml
-# 每個交易日在台股、美股收盤後各抓一次，結果強制推送到 data 分支（只保留最新一版，repo 不會變大）。
+# 每個交易日在台股收盤後抓兩次、美股收盤後抓一次，結果強制推送到 data 分支（只保留最新一版，repo 不會變大）。
 name: fetch-market-data
 on:
   schedule:
     - cron: "20 6 * * 1-5"     # 台北 14:20，台股收盤後
+    - cron: "30 10 * * 1-5"    # 台北 18:30，官方收盤行情公布後再補一次
     - cron: "40 21 * * 1-5"    # 台北隔日 05:40，美股收盤後（冬令、夏令皆已收盤）
   workflow_dispatch:           # 也可以在 Actions 頁面手動執行
 permissions:
