@@ -1,0 +1,29 @@
+# 放到你的 GitHub repo：.github/workflows/fetch.yml
+# 每個交易日在台股、美股收盤後各抓一次，結果強制推送到 data 分支（只保留最新一版，repo 不會變大）。
+name: fetch-market-data
+on:
+  schedule:
+    - cron: "20 6 * * 1-5"     # 台北 14:20，台股收盤後
+    - cron: "40 21 * * 1-5"    # 台北隔日 05:40，美股收盤後（冬令、夏令皆已收盤）
+  workflow_dispatch:           # 也可以在 Actions 頁面手動執行
+permissions:
+  contents: write
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install yfinance pandas
+      - run: python fetch_data.py --source yahoo --universe universe.csv --out data --years 3
+      - name: Publish to data branch
+        run: |
+          cd data
+          git init -q -b data
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -q -m "data $(date -u +%FT%TZ)"
+          git push -f "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" data
