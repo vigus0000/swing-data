@@ -166,6 +166,13 @@ def fetch_yahoo(universe: pd.DataFrame, years: float, out_dir, now_utc=None, dow
         official.update(diag)
         official["yahoo_tw_last_date"] = str(tw_last_before.date()) if tw_last_before is not None else None
         official.update(patch_tw_latest(frames, universe, tw_quotes))
+    still = [s for s in cands if s not in frames]          # Yahoo 偶爾單檔失敗：缺的再逐檔試一次
+    for sym in still:
+        for tkr in cands[sym]:
+            got1 = download_all([tkr], start, downloader)
+            if tkr in got1:
+                resolved[sym], frames[sym] = tkr, got1[tkr]
+                break
     bars, missing = [], []
     for _, r in universe.iterrows():
         d = frames.get(r["symbol"])
@@ -213,6 +220,9 @@ def fetch_yahoo(universe: pd.DataFrame, years: float, out_dir, now_utc=None, dow
         "has_incomplete_bar": {m: bool((~g["bar_complete"]).any()) for m, g in bars.groupby("market")},
         "market_series_ok": sorted(set(mkt["series"])), "market_series_missing": series_missing,
         "tw_official": official,
+        "tw_latest_coverage": (lambda t: {"latest": t["date"].max(), "symbols": int(t["symbol"].nunique()),
+                                          "symbols_at_latest": int((t["date"] == t["date"].max()).sum())} if len(t) else {})(
+            bars[bars["market"] == "TW"]),
         "note": "價格已還原權息；非官方來源，請抽查。bar_complete=False 的 K 棒不會被模型使用。",
     }
     (out_dir / "fetch_report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -220,14 +230,17 @@ def fetch_yahoo(universe: pd.DataFrame, years: float, out_dir, now_utc=None, dow
 
 
 # ----------------------------------------------------------------- 台股官方資料（補 Yahoo 缺的最新一日）
-OFFICIAL = {
-    "twse": "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL",
-    "tpex": "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes",
-    "taiex": "https://openapi.twse.com.tw/v1/exchangeReport/FMTQIK",
+OFFICIAL = {  # 每一類依序全部嘗試，取日期最新的；OpenAPI 有時比網站晚更新
+    "twse": ["https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL",
+             "https://www.twse.com.tw/rwd/zh/afterTrading/STOCK_DAY_ALL?response=json",
+             "https://www.twse.com.tw/exchangeReport/STOCK_DAY_ALL?response=json"],
+    "tpex": ["https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes"],
+    "taiex": ["https://openapi.twse.com.tw/v1/exchangeReport/FMTQIK",
+              "https://www.twse.com.tw/rwd/zh/afterTrading/FMTQIK?response=json"],
 }
 KEYS = {  # 欄位名稱可能調整，逐一嘗試
     "code": ("Code", "SecuritiesCompanyCode", "證券代號", "代號"),
-    "date": ("Date", "date", "日期", "資料日期"),
+    "date": ("Date", "date", "日期", "資料日期", "_payload_date"),
     "open": ("OpeningPrice", "Open", "開盤價", "開盤"),
     "high": ("HighestPrice", "High", "最高價", "最高"),
     "low": ("LowestPrice", "Low", "最低價", "最低"),
@@ -241,6 +254,25 @@ def _http_json(url: str):
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"})
     with urllib.request.urlopen(req, timeout=40) as f:
         return json.loads(f.read().decode("utf-8-sig"))
+
+
+def _records(payload) -> list:
+    """OpenAPI 回傳紀錄清單；網站版回傳 {fields, data, date} 或 {tables:[{fields,data}]}，統一轉成紀錄清單。"""
+    if isinstance(payload, list):
+        return [r for r in payload if isinstance(r, dict)]
+    if not isinstance(payload, dict):
+        return []
+    tables = payload.get("tables") or [payload]
+    out = []
+    for t in tables:
+        fields, data = t.get("fields"), t.get("data")
+        if not fields or not data:
+            continue
+        for row in data:
+            rec = dict(zip([str(x).strip() for x in fields], row))
+            rec["_payload_date"] = payload.get("date", "")
+            out.append(rec)
+    return out
 
 
 def _pick(rec: dict, field: str):
@@ -273,36 +305,44 @@ def parse_tw_date(x):
 def fetch_tw_official(http=None) -> tuple[dict, list, dict]:
     """回傳 ({代號: 最新一日 K}, [(日期, 加權指數收盤)], 診斷資訊)。任何一段失敗都只記錄，不中斷。"""
     http = http or _http_json
-    quotes, taiex, diag = {}, [], {}
-    try:
-        rows = http(OFFICIAL["taiex"])
-        for r in rows:
-            d, v = parse_tw_date(_pick(r, "date")), _num(_pick(r, "taiex"))
-            if d and v == v and v > 0:
-                taiex.append((d, v))
-        diag["taiex"] = {"status": "ok", "records": len(rows), "last_date": str(max(d for d, _ in taiex)) if taiex else None,
-                         "keys": sorted(rows[0])[:12] if rows else []}
-    except Exception as exc:
-        diag["taiex"] = {"status": "error", "error": f"{type(exc).__name__}: {exc}"[:200]}
-    fallback_date = max((d for d, _ in taiex), default=None)
-    for name in ("twse", "tpex"):
+    quotes, taiex, diag = {}, {}, {}
+    diag["taiex"] = []
+    for url in OFFICIAL["taiex"]:
         try:
-            rows = http(OFFICIAL[name])
-            n, dates = 0, set()
+            rows = _records(http(url))
+            got = {}
             for r in rows:
-                code = str(_pick(r, "code") or "").strip()
-                d = parse_tw_date(_pick(r, "date")) or (fallback_date if name == "twse" else None)
-                o, h, l, c = (_num(_pick(r, k)) for k in ("open", "high", "low", "close"))
-                if not code or d is None or not all(x == x and x > 0 for x in (o, h, l, c)):
-                    continue
-                vol = _num(_pick(r, "volume"))
-                quotes[code] = {"date": d, "open": o, "high": h, "low": l, "close": c, "volume": 0.0 if vol != vol else vol}
-                n, dates = n + 1, dates | {d}
-            diag[name] = {"status": "ok", "records": len(rows), "usable": n, "dates": sorted(str(x) for x in dates)[-2:],
-                          "keys": sorted(rows[0])[:14] if rows else []}
+                d, v = parse_tw_date(_pick(r, "date")), _num(_pick(r, "taiex"))
+                if d and v == v and v > 0:
+                    got[d] = v
+            taiex.update({d: v for d, v in got.items() if d not in taiex})
+            diag["taiex"].append({"url": url, "status": "ok", "records": len(rows), "last_date": str(max(got)) if got else None,
+                                  "keys": sorted(rows[0])[:12] if rows else []})
         except Exception as exc:
-            diag[name] = {"status": "error", "error": f"{type(exc).__name__}: {exc}"[:200]}
-    return quotes, taiex, diag
+            diag["taiex"].append({"url": url, "status": "error", "error": f"{type(exc).__name__}: {exc}"[:200]})
+    fallback_date = max(taiex, default=None)
+    for name in ("twse", "tpex"):
+        diag[name] = []
+        for url in OFFICIAL[name]:
+            try:
+                rows = _records(http(url))
+                n, dates = 0, set()
+                for r in rows:
+                    code = str(_pick(r, "code") or "").strip()
+                    d = parse_tw_date(_pick(r, "date")) or (fallback_date if name == "twse" else None)
+                    o, h, l, c = (_num(_pick(r, k)) for k in ("open", "high", "low", "close"))
+                    if not code or d is None or not all(x == x and x > 0 for x in (o, h, l, c)):
+                        continue
+                    n, dates = n + 1, dates | {d}
+                    if code in quotes and quotes[code]["date"] >= d:
+                        continue                          # 已有同日或更新的資料
+                    vol = _num(_pick(r, "volume"))
+                    quotes[code] = {"date": d, "open": o, "high": h, "low": l, "close": c, "volume": 0.0 if vol != vol else vol}
+                diag[name].append({"url": url, "status": "ok", "records": len(rows), "usable": n,
+                                   "dates": sorted(str(x) for x in dates)[-2:], "keys": sorted(rows[0])[:14] if rows else []})
+            except Exception as exc:
+                diag[name].append({"url": url, "status": "error", "error": f"{type(exc).__name__}: {exc}"[:200]})
+    return quotes, sorted(taiex.items()), diag
 
 
 def patch_tw_latest(frames: dict, universe: pd.DataFrame, quotes: dict) -> dict:
@@ -369,9 +409,14 @@ def describe(report: dict, now_utc=None) -> list:
     if off.get("patched_symbols"):
         lines.append(f"台股 {off['patched_date']} 的日 K 由證交所／櫃買資料補上 {off['patched_symbols']} 檔（Yahoo 只到 {off.get('yahoo_tw_last_date')}）；"
                      "這一根是未還原的原始價。")
-    bad = [k for k in ("twse", "tpex", "taiex") if (off.get(k) or {}).get("status") == "error"]
+    bad = [k for k in ("twse", "tpex", "taiex")
+           if off.get(k) and all(x.get("status") == "error" for x in off[k])]
     if bad:
         lines.append(f"[提示] 台股官方資料取得失敗：{', '.join(bad)}（詳見 fetch_report.json），台股最新一日可能缺漏。")
+    cov = report.get("tw_latest_coverage") or {}
+    if cov.get("symbols_at_latest", 0) < cov.get("symbols", 0):
+        lines.append(f"[警告] 台股 {cov['latest']} 只有 {cov['symbols_at_latest']}/{cov['symbols']} 檔有日 K（來源尚未更新完）；"
+                     "模型會自動改用多數股票都有的前一個交易日。")
     if off.get("close_check_max_diff_pct") is not None and off["close_check_max_diff_pct"] > 0.5:
         lines.append(f"[警告] Yahoo 與官方收盤價最大差異 {off['close_check_max_diff_pct']}%：請抽查資料。")
     if off.get("symbols_with_older_gap"):
