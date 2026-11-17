@@ -162,7 +162,10 @@ def fetch_yahoo(universe: pd.DataFrame, years: float, out_dir, now_utc=None, dow
     if use_official and (universe["market"] == "TW").any():
         tw_last_before = max((d["date"].iloc[-1] for s, d in frames.items()
                               if s in set(universe.loc[universe["market"] == "TW", "symbol"])), default=None)
-        tw_quotes, taiex_rows, diag = fetch_tw_official(http)
+        expect = last_complete_date("TW", now_utc)
+        while expect.weekday() >= 5:                      # 週末退回週五
+            expect -= dt.timedelta(days=1)
+        tw_quotes, taiex_rows, diag = fetch_tw_official(http, expect)
         official.update(diag)
         official["yahoo_tw_last_date"] = str(tw_last_before.date()) if tw_last_before is not None else None
         official.update(patch_tw_latest(frames, universe, tw_quotes))
@@ -232,8 +235,8 @@ def fetch_yahoo(universe: pd.DataFrame, years: float, out_dir, now_utc=None, dow
 # ----------------------------------------------------------------- 台股官方資料（補 Yahoo 缺的最新一日）
 OFFICIAL = {  # 每一類依序全部嘗試，取日期最新的；OpenAPI 有時比網站晚更新
     "twse": ["https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL",
-             "https://www.twse.com.tw/rwd/zh/afterTrading/STOCK_DAY_ALL?response=json",
-             "https://www.twse.com.tw/exchangeReport/STOCK_DAY_ALL?response=json"],
+             "https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX?date={date}&type=ALLBUT0999&response=json",
+             "https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX?type=ALLBUT0999&response=json"],
     "tpex": ["https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes"],
     "taiex": ["https://openapi.twse.com.tw/v1/exchangeReport/FMTQIK",
               "https://www.twse.com.tw/rwd/zh/afterTrading/FMTQIK?response=json"],
@@ -302,9 +305,11 @@ def parse_tw_date(x):
     return None
 
 
-def fetch_tw_official(http=None) -> tuple[dict, list, dict]:
-    """回傳 ({代號: 最新一日 K}, [(日期, 加權指數收盤)], 診斷資訊)。任何一段失敗都只記錄，不中斷。"""
+def fetch_tw_official(http=None, expect_date=None) -> tuple[dict, list, dict]:
+    """回傳 ({代號: 最新一日 K}, [(日期, 加權指數收盤)], 診斷資訊)。任何一段失敗都只記錄，不中斷。
+    expect_date：預期的最新交易日，用來向證交所網站查詢指定日期的每日收盤行情。"""
     http = http or _http_json
+    ymd = expect_date.strftime("%Y%m%d") if expect_date else None
     quotes, taiex, diag = {}, {}, {}
     diag["taiex"] = []
     for url in OFFICIAL["taiex"]:
@@ -324,6 +329,10 @@ def fetch_tw_official(http=None) -> tuple[dict, list, dict]:
     for name in ("twse", "tpex"):
         diag[name] = []
         for url in OFFICIAL[name]:
+            if "{date}" in url:
+                if not ymd:
+                    continue
+                url = url.format(date=ymd)
             try:
                 rows = _records(http(url))
                 n, dates = 0, set()
