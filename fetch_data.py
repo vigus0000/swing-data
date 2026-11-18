@@ -33,6 +33,7 @@ import pandas as pd
 
 ROOT = Path(__file__).resolve().parent.parent
 FILES = ("bars.csv", "market.csv", "fetch_report.json")
+OPTIONAL_FILES = ("index_long.csv",)        # 大盤指數長歷史（路線 A 研究用），資料分支可以沒有
 # 市場序列名稱 -> (Yahoo 代號, 用哪個市場的收盤時間判斷當日數值是否完成)
 MARKET_SERIES = {
     "TAIEX": ("^TWII", "TW"), "SPX": ("^GSPC", "US"), "SOX": ("^SOX", "US"), "VIX": ("^VIX", "US"),
@@ -141,7 +142,7 @@ def last_complete_date(market: str, now_utc: dt.datetime) -> dt.date:
 
 
 def fetch_yahoo(universe: pd.DataFrame, years: float, out_dir, now_utc=None, downloader=None, http=None,
-                use_official: bool = True) -> dict:
+                use_official: bool = True, index_years: float = 0) -> dict:
     now_utc = now_utc or dt.datetime.now(dt.timezone.utc)
     start = (now_utc.date() - dt.timedelta(days=int(years * 365.25) + 5)).isoformat()
     out_dir = Path(out_dir)
@@ -213,6 +214,18 @@ def fetch_yahoo(universe: pd.DataFrame, years: float, out_dir, now_utc=None, dow
     series_missing.append("TWVIX")          # Yahoo 沒有台指 VIX；需要時請自行加入 market.csv
     mkt = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame(columns=["date", "series", "value"])
     mkt.to_csv(out_dir / "market.csv", index=False)
+    if index_years and index_years > 0:        # 只含 TAIEX 與 SPX 的長歷史，格式同 market.csv；失敗不影響主資料
+        lstart = (now_utc.date() - dt.timedelta(days=int(index_years * 365.25) + 5)).isoformat()
+        lg = download_all([MARKET_SERIES[k][0] for k in ("TAIEX", "SPX")], lstart, downloader)
+        lrows = []
+        for name in ("TAIEX", "SPX"):
+            d = lg.get(MARKET_SERIES[name][0])
+            if d is None:
+                continue
+            d = d[d["date"].dt.date <= last_complete_date(MARKET_SERIES[name][1], now_utc)]
+            lrows.append(pd.DataFrame({"date": d["date"].dt.strftime("%Y-%m-%d"), "series": name, "value": d["close"]}))
+        if lrows:
+            pd.concat(lrows, ignore_index=True).to_csv(out_dir / "index_long.csv", index=False)
 
     done = bars[bars["bar_complete"]]
     report = {
@@ -392,11 +405,20 @@ def fetch_github(repo: str, branch: str, out_dir, clone_url: str | None = None) 
                 if not (dst / name).exists():
                     raise SystemExit(f"資料分支 {branch} 裡找不到 {name}：請確認 GitHub Actions 已成功執行過一次。")
                 shutil.copy(dst / name, out_dir / name)
+            for name in OPTIONAL_FILES:
+                if (dst / name).exists():
+                    shutil.copy(dst / name, out_dir / name)
         else:
             try:
                 for name in FILES:
                     with urllib.request.urlopen(f"https://raw.githubusercontent.com/{repo}/{branch}/{name}", timeout=60) as f:
                         (out_dir / name).write_bytes(f.read())
+                for name in OPTIONAL_FILES:
+                    try:
+                        with urllib.request.urlopen(f"https://raw.githubusercontent.com/{repo}/{branch}/{name}", timeout=60) as f:
+                            (out_dir / name).write_bytes(f.read())
+                    except Exception:
+                        pass
             except Exception as exc:
                 raise SystemExit(f"無法從 GitHub 取得資料（git: {r.stderr.strip()[:200]}；raw: {exc}）。"
                                  "請確認 repo 是公開的、名稱正確、資料分支已建立。") from exc
@@ -441,6 +463,7 @@ def main(argv=None):
     ap.add_argument("--universe", default=str(ROOT / "assets" / "universe.csv"))
     ap.add_argument("--add", action="append", default=[], help="臨時加入的代號，逗號分隔（僅 yahoo 來源有效）")
     ap.add_argument("--years", type=float, default=3.0)
+    ap.add_argument("--index-years", type=float, default=0.0, help="另存 TAIEX、SPX 的長歷史到 index_long.csv（例如 40）")
     ap.add_argument("--out", default="data")
     ap.add_argument("--repo", default=None, help="GitHub repo（owner/name）；預設讀 assets/data_source.json")
     ap.add_argument("--branch", default=None)
@@ -457,7 +480,7 @@ def main(argv=None):
             print("[提示] --add 對 github 來源無效：要新增股票請修改 repo 裡的 universe.csv。", file=sys.stderr)
         report = fetch_github(repo, branch, a.out)
     else:
-        report = fetch_yahoo(load_universe(a.universe, a.add), a.years, a.out, use_official=not a.no_official)
+        report = fetch_yahoo(load_universe(a.universe, a.add), a.years, a.out, use_official=not a.no_official, index_years=a.index_years)
     for line in describe(report):
         print(line)
     print(f"已寫入 {Path(a.out).resolve()}/bars.csv、market.csv、fetch_report.json")
