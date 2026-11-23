@@ -18,7 +18,7 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install yfinance pandas
-      - run: python fetch_data.py --source yahoo --universe universe.csv --out data --years 7 --index-years 40
+      - run: python fetch_data.py --source yahoo --universe universe.csv --out data --years 7 --index-years 40 --asset-years 25 --global-years 56
       - name: Publish to data branch
         run: |
           cd data
