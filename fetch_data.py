@@ -33,18 +33,15 @@ import pandas as pd
 
 ROOT = Path(__file__).resolve().parent.parent
 FILES = ("bars.csv", "market.csv", "fetch_report.json")
-OPTIONAL_FILES = ("index_long.csv", "assets_long.csv")        # 長歷史（研究用），資料分支可以沒有
+OPTIONAL_FILES = ("index_long.csv",)        # 長歷史（研究用），資料分支可以沒有
 # 市場序列名稱 -> (Yahoo 代號, 用哪個市場的收盤時間判斷當日數值是否完成)
 MARKET_SERIES = {
     "TAIEX": ("^TWII", "TW"), "SPX": ("^GSPC", "US"), "SOX": ("^SOX", "US"), "VIX": ("^VIX", "US"),
     "GOLD": ("GC=F", "US"), "OIL": ("CL=F", "US"), "USDTWD": ("TWD=X", "US"), "DXY": ("DX-Y.NYB", "US"),
     "US10Y": ("^TNX", "US"),
 }
-# 多資產研究用的 ETF（auto_adjust 含配息再投入；SHY 當現金代理）-> (Yahoo 代號, 市場)
-ASSET_SERIES = {"SPY": ("SPY", "US"), "TLT": ("TLT", "US"), "IEF": ("IEF", "US"), "SHY": ("SHY", "US"), "GLD": ("GLD", "US"), "0050": ("0050.TW", "TW"),
-                "QQQ": ("QQQ", "US"), "IWM": ("IWM", "US"), "EFA": ("EFA", "US"), "EEM": ("EEM", "US"), "VNQ": ("VNQ", "US"),
-                "SSO": ("SSO", "US"), "SH": ("SH", "US"), "SDS": ("SDS", "US"),
-                "00631L": ("00631L.TW", "TW"), "00632R": ("00632R.TW", "TW")}   # 槓桿／反向型（H6 用 SSO、SH；其餘供描述與實作參考）
+# 大盤趨勢策略用的指數長歷史（價格指數，不含股息）與現金利率 -> (Yahoo 代號, 市場)；IRX = 13 週國庫券殖利率（%），當作美元現金報酬與槓桿融資成本
+LONG_SERIES = {"SPX": ("^GSPC", "US"), "NDX": ("^NDX", "US"), "RUT": ("^RUT", "US"), "TAIEX": ("^TWII", "TW"), "IRX": ("^IRX", "US")}
 # 收盤後多久才把當日 K 棒視為完成（當地時間）
 CLOSE = {"TW": ("Asia/Taipei", dt.time(14, 0)), "US": ("America/New_York", dt.time(16, 20))}
 
@@ -147,7 +144,7 @@ def last_complete_date(market: str, now_utc: dt.datetime) -> dt.date:
 
 
 def fetch_yahoo(universe: pd.DataFrame, years: float, out_dir, now_utc=None, downloader=None, http=None,
-                use_official: bool = True, index_years: float = 0, asset_years: float = 0) -> dict:
+                use_official: bool = True, index_years: float = 0) -> dict:
     now_utc = now_utc or dt.datetime.now(dt.timezone.utc)
     start = (now_utc.date() - dt.timedelta(days=int(years * 365.25) + 5)).isoformat()
     out_dir = Path(out_dir)
@@ -219,32 +216,18 @@ def fetch_yahoo(universe: pd.DataFrame, years: float, out_dir, now_utc=None, dow
     series_missing.append("TWVIX")          # Yahoo 沒有台指 VIX；需要時請自行加入 market.csv
     mkt = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame(columns=["date", "series", "value"])
     mkt.to_csv(out_dir / "market.csv", index=False)
-    if index_years and index_years > 0:        # TAIEX、SPX 與外部風險因子（VIX、油、美元、殖利率、SOX、黃金、台幣）的長歷史，格式同 market.csv；失敗不影響主資料
+    if index_years and index_years > 0:        # 大盤指數（SPX、NDX、RUT、TAIEX）與 IRX 的長歷史，格式同 market.csv；失敗不影響主資料
         lstart = (now_utc.date() - dt.timedelta(days=int(index_years * 365.25) + 5)).isoformat()
-        LONG = ("TAIEX", "SPX", "VIX", "OIL", "DXY", "US10Y", "SOX", "GOLD", "USDTWD")      # 指數與外部風險因子長歷史
-        lg = download_all([MARKET_SERIES[k][0] for k in LONG], lstart, downloader)
+        lg = download_all([v[0] for v in LONG_SERIES.values()], lstart, downloader)
         lrows = []
-        for name in LONG:
-            d = lg.get(MARKET_SERIES[name][0])
-            if d is None:
-                continue
-            d = d[d["date"].dt.date <= last_complete_date(MARKET_SERIES[name][1], now_utc)]
-            lrows.append(pd.DataFrame({"date": d["date"].dt.strftime("%Y-%m-%d"), "series": name, "value": d["close"]}))
-        if lrows:
-            pd.concat(lrows, ignore_index=True).to_csv(out_dir / "index_long.csv", index=False)
-
-    if asset_years and asset_years > 0:        # 多資產 ETF 長歷史（總報酬調整價）；失敗不影響主資料
-        astart = (now_utc.date() - dt.timedelta(days=int(asset_years * 365.25) + 5)).isoformat()
-        ag = download_all([v[0] for v in ASSET_SERIES.values()], astart, downloader)
-        arows = []
-        for name, (tk, mkt_code) in ASSET_SERIES.items():
-            d = ag.get(tk)
+        for name, (tk, mkt_code) in LONG_SERIES.items():
+            d = lg.get(tk)
             if d is None:
                 continue
             d = d[d["date"].dt.date <= last_complete_date(mkt_code, now_utc)]
-            arows.append(pd.DataFrame({"date": d["date"].dt.strftime("%Y-%m-%d"), "series": name, "value": d["close"]}))
-        if arows:
-            pd.concat(arows, ignore_index=True).to_csv(out_dir / "assets_long.csv", index=False)
+            lrows.append(pd.DataFrame({"date": d["date"].dt.strftime("%Y-%m-%d"), "series": name, "value": d["close"]}))
+        if lrows:
+            pd.concat(lrows, ignore_index=True).to_csv(out_dir / "index_long.csv", index=False)
 
     done = bars[bars["bar_complete"]]
     report = {
@@ -483,7 +466,6 @@ def main(argv=None):
     ap.add_argument("--add", action="append", default=[], help="臨時加入的代號，逗號分隔（僅 yahoo 來源有效）")
     ap.add_argument("--years", type=float, default=3.0)
     ap.add_argument("--index-years", type=float, default=0.0, help="另存 TAIEX、SPX 的長歷史到 index_long.csv（例如 40）")
-    ap.add_argument("--asset-years", type=float, default=0.0, help="另存 11 檔 ETF 與 5 檔槓桿／反向型 ETF（SSO、SH、SDS、00631L、00632R）的長歷史到 assets_long.csv（例如 25）")
     ap.add_argument("--out", default="data")
     ap.add_argument("--repo", default=None, help="GitHub repo（owner/name）；預設讀 assets/data_source.json")
     ap.add_argument("--branch", default=None)
@@ -500,7 +482,7 @@ def main(argv=None):
             print("[提示] --add 對 github 來源無效：要新增股票請修改 repo 裡的 universe.csv。", file=sys.stderr)
         report = fetch_github(repo, branch, a.out)
     else:
-        report = fetch_yahoo(load_universe(a.universe, a.add), a.years, a.out, use_official=not a.no_official, index_years=a.index_years, asset_years=a.asset_years)
+        report = fetch_yahoo(load_universe(a.universe, a.add), a.years, a.out, use_official=not a.no_official, index_years=a.index_years)
     for line in describe(report):
         print(line)
     print(f"已寫入 {Path(a.out).resolve()}/bars.csv、market.csv、fetch_report.json")
